@@ -25,7 +25,7 @@ TIMEFRAME     = "15"       # 15-minute candles
 SCAN_INTERVAL = 60         # seconds between full scans
 RECV_WINDOW   = "5000"
 
-MARGIN_PER_TRADE = 1.0    # $1 margin per trade
+MARGIN_PER_TRADE = 1.5    # $1.5 margin per trade
 MAX_POSITIONS    = 5      # max concurrent open positions
 MAX_LOSS_TOTAL   = 30.0   # hard stop: realized PnL hits -$30
 SL_PCT           = 0.005  # stop-loss  = 0.5% dari harga entry
@@ -423,4 +423,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-  
