@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 Bybit USDT Perpetual Futures Scalping Bot
-Strategy : 3 Candlestick Patterns (Engulfing, Doji, Harami)
-Timeframe: 1H | SL dinamis per pola | TP 1% fixed
+Strategy : Doji Candlestick Pattern Only
+Timeframe: 1H | SL dinamis (low/high doji) | TP 1% fixed
 Author   : Built with Claude
 
-SL Rules:
-- Engulfing : SL di low/high candle engulfing
-- Doji      : SL di low/high candle doji
-- Harami    : SL di low/high candle induk (prev)
-
-TP: 1% dari harga entry (fixed)
+Logic:
+- BULLISH DOJI : doji muncul setelah candle bearish → entry LONG
+                 SL = low candle doji
+- BEARISH DOJI : doji muncul setelah candle bullish → entry SHORT
+                 SL = high candle doji
 """
 
 import os, time, json, math, logging, base64
@@ -34,19 +33,22 @@ SCAN_INTERVAL    = 120     # scan setiap 2 menit
 MARGIN_PER_TRADE = 1.5
 MAX_POSITIONS    = 5
 MAX_LOSS_TOTAL   = 30.0
-TP_PCT           = 0.010   # TP fixed 1%
+SL_PCT_FIXED     = 0.004   # SL fixed 0.4% dari harga entry
+TP_PCT           = 0.007   # TP fixed 0.7% dari harga entry
 RECV_WINDOW      = "5000"
 
-# Candlestick thresholds
+# Doji threshold
 DOJI_BODY_PCT    = 0.05    # body <= 5% dari total range = doji
-ENGULF_BODY_PCT  = 0.6     # body engulfing >= 60% dari range
-HARAMI_BODY_PCT  = 0.5     # body harami <= 50% dari body induk
 
 TOP_PAIRS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
     "ADAUSDT","AVAXUSDT","DOGEUSDT","DOTUSDT","MATICUSDT",
     "LINKUSDT","LTCUSDT","UNIUSDT","ATOMUSDT","ETCUSDT",
     "XLMUSDT","BCHUSDT","NEARUSDT","ALGOUSDT","FILUSDT",
+    "APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT",
+    "SEIUSDT","TIAUSDT","FETUSDT","WLDUSDT","STXUSDT",
+    "RUNEUSDT","AAVEUSDT","MKRUSDT","SNXUSDT","CRVUSDT",
+    "LDOUSDT","RNDRUSDT","GRTUSDT","FLOWUSDT","KAVAUSDT",
 ]
 
 # ══════════════════════════════════════════════════
@@ -61,7 +63,7 @@ log = logging.getLogger(__name__)
 total_realized_pnl: float = 0.0
 open_positions: dict = {}
 _instrument_cache: dict = {}
-_last_signal: dict = {}  # track sinyal terakhir per pair biar ga double entry
+_last_signal: dict = {}
 
 # ══════════════════════════════════════════════════
 #  RSA SIGNING
@@ -122,7 +124,7 @@ def notify(msg):
 # ══════════════════════════════════════════════════
 #  MARKET DATA
 # ══════════════════════════════════════════════════
-def get_candles(symbol, limit=6):
+def get_candles(symbol, limit=5):
     r = api_get("/v5/market/kline", {
         "category": CATEGORY, "symbol": symbol,
         "interval": TIMEFRAME, "limit": str(limit)
@@ -185,116 +187,32 @@ def round_qty(qty, step):
     return f"{math.floor(qty / step) * step:.{dec}f}"
 
 # ══════════════════════════════════════════════════
-#  HELPERS
+#  DOJI PATTERN
 # ══════════════════════════════════════════════════
-def body(c):
-    return abs(c["close"] - c["open"])
-
-def total_range(c):
-    return c["high"] - c["low"]
-
-# ══════════════════════════════════════════════════
-#  CANDLESTICK PATTERNS
-# ══════════════════════════════════════════════════
-
-# ── 1. ENGULFING ──────────────────────────────────
-def check_engulfing(prev2, prev, curr):
-    """
-    Returns ('long', sl) atau ('short', sl) atau None.
-    SL = low/high candle engulfing.
-    Skip jika menelan 2 candle sekaligus.
-    """
-    tr = total_range(curr)
+def is_doji(c) -> bool:
+    """Candle doji: body <= 5% dari total range."""
+    tr = c["high"] - c["low"]
     if tr == 0:
-        return None
+        return False
+    body = abs(c["close"] - c["open"])
+    return body / tr <= DOJI_BODY_PCT
 
-    # BULLISH ENGULFING
-    if (prev["close"] < prev["open"] and
-        curr["close"] > curr["open"] and
-        curr["open"]  <= prev["close"] and
-        curr["close"] >= prev["open"] and
-        body(curr) / tr >= ENGULF_BODY_PCT):
-
-        # Cek apakah juga menelan prev2 → skip
-        if (prev2["close"] < prev2["open"] and
-            curr["open"]  <= prev2["close"] and
-            curr["close"] >= prev2["open"]):
-            return None  # menelan 2 candle → skip
-
-        sl = curr["low"]
-        return ("long", sl, "Bullish Engulfing")
-
-    # BEARISH ENGULFING
-    if (prev["close"] > prev["open"] and
-        curr["close"] < curr["open"] and
-        curr["open"]  >= prev["close"] and
-        curr["close"] <= prev["open"] and
-        body(curr) / tr >= ENGULF_BODY_PCT):
-
-        # Cek apakah juga menelan prev2 → skip
-        if (prev2["close"] > prev2["open"] and
-            curr["open"]  >= prev2["close"] and
-            curr["close"] <= prev2["open"]):
-            return None  # menelan 2 candle → skip
-
-        sl = curr["high"]
-        return ("short", sl, "Bearish Engulfing")
-
-    return None
-
-# ── 2. DOJI ───────────────────────────────────────
 def check_doji(prev, curr):
     """
-    Returns ('long', sl) atau ('short', sl) atau None.
-    SL = low/high candle doji.
+    Bullish Doji : doji setelah candle bearish → Long, SL = low doji
+    Bearish Doji : doji setelah candle bullish → Short, SL = high doji
+    Returns (direction, sl_price, pattern) atau None
     """
-    tr = total_range(curr)
-    if tr == 0:
+    if not is_doji(curr):
         return None
 
-    if body(curr) / tr > DOJI_BODY_PCT:
-        return None  # bukan doji
-
-    # BULLISH DOJI: muncul setelah candle bearish
+    # BULLISH DOJI
     if prev["close"] < prev["open"]:
-        sl = curr["low"]
-        return ("long", sl, "Bullish Doji")
+        return ("long", curr["low"], "Bullish Doji ⭐")
 
-    # BEARISH DOJI: muncul setelah candle bullish
+    # BEARISH DOJI
     if prev["close"] > prev["open"]:
-        sl = curr["high"]
-        return ("short", sl, "Bearish Doji")
-
-    return None
-
-# ── 3. HARAMI ─────────────────────────────────────
-def check_harami(prev, curr):
-    """
-    Returns ('long', sl) atau ('short', sl) atau None.
-    SL = low/high candle induk (prev).
-    """
-    if body(prev) == 0:
-        return None
-
-    # BULLISH HARAMI
-    if (prev["close"] < prev["open"] and      # prev bearish besar
-        curr["close"] > curr["open"] and      # curr bullish
-        curr["open"]  >= prev["close"] and    # curr body di dalam prev body
-        curr["close"] <= prev["open"] and
-        body(curr) / body(prev) <= HARAMI_BODY_PCT):
-
-        sl = prev["low"]  # SL di low candle induk
-        return ("long", sl, "Bullish Harami")
-
-    # BEARISH HARAMI
-    if (prev["close"] > prev["open"] and      # prev bullish besar
-        curr["close"] < curr["open"] and      # curr bearish
-        curr["open"]  <= prev["close"] and    # curr body di dalam prev body
-        curr["close"] >= prev["open"] and
-        body(curr) / body(prev) <= HARAMI_BODY_PCT):
-
-        sl = prev["high"]  # SL di high candle induk
-        return ("short", sl, "Bearish Harami")
+        return ("short", curr["high"], "Bearish Doji ⭐")
 
     return None
 
@@ -302,30 +220,19 @@ def check_harami(prev, curr):
 #  SIGNAL ENGINE
 # ══════════════════════════════════════════════════
 def get_signal(symbol):
-    """
-    Returns (direction, sl_price, pattern_name) atau (None, None, None).
-    Menggunakan candle 1H yang sudah closed.
-    """
-    candles = get_candles(symbol, 6)
-    if len(candles) < 4:
+    candles = get_candles(symbol, 5)
+    if len(candles) < 3:
         return None, None, None
 
-    prev2 = candles[-4]
-    prev  = candles[-3]
-    curr  = candles[-2]  # candle 1H terakhir yang sudah closed
+    prev = candles[-3]
+    curr = candles[-2]  # candle 1H terakhir yang sudah closed
 
     # Cegah double entry pada candle yang sama
     candle_ts = curr["ts"]
     if _last_signal.get(symbol) == candle_ts:
         return None, None, None
 
-    # Cek 3 pola
-    result = (
-        check_engulfing(prev2, prev, curr) or
-        check_doji(prev, curr) or
-        check_harami(prev, curr)
-    )
-
+    result = check_doji(prev, curr)
     if result:
         _last_signal[symbol] = candle_ts
         direction, sl_price, pattern = result
@@ -368,21 +275,20 @@ def place_order(symbol, direction, sl_price_raw, pattern):
     step    = qty_step(symbol)
     qty_str = round_qty(pos_value / price, step)
 
-    # SL dinamis dari candle pattern
-    sl_price = round_price(sl_price_raw, tick)
-
-    # TP fixed 1% dari entry
+    # SL fixed 0.4% dari entry
     if direction == "long":
         side     = "Buy"
+        sl_price = round_price(price * (1 - SL_PCT_FIXED), tick)
         tp_price = round_price(price * (1 + TP_PCT), tick)
     else:
         side     = "Sell"
+        sl_price = round_price(price * (1 + SL_PCT_FIXED), tick)
         tp_price = round_price(price * (1 - TP_PCT), tick)
 
-    # Hitung RR untuk info
-    sl_dist = abs(price - sl_price_raw)
-    tp_dist = abs(price * TP_PCT)
-    rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
+    # Hitung RR actual
+    sl_dist = price * SL_PCT_FIXED
+    tp_dist = price * TP_PCT
+    rr = round(tp_dist / sl_dist, 2)
 
     r = api_post("/v5/order/create", {
         "category": CATEGORY, "symbol": symbol,
@@ -397,12 +303,13 @@ def place_order(symbol, direction, sl_price_raw, pattern):
             "sl": sl_price, "tp": tp_price,
             "leverage": lev, "pattern": pattern,
         }
+        sl_label = "-0.4%"
         msg = (
             f"✅ <b>OPEN {direction.upper()}</b>\n"
             f"Pair     : {symbol}\n"
             f"Pattern  : {pattern}\n"
             f"Entry    : {price}\n"
-            f"SL       : {sl_price} (candle {direction == 'long' and 'low' or 'high'})\n"
+            f"SL       : {sl_price} ({sl_label})\n"
             f"TP       : {tp_price} (+1.0%)\n"
             f"RR       : 1:{rr}\n"
             f"Leverage : {lev}x  |  Margin: ${MARGIN_PER_TRADE}\n"
@@ -446,14 +353,15 @@ def sync_closed():
 #  MAIN LOOP
 # ══════════════════════════════════════════════════
 def run():
-    log.info("🤖 Bot Candlestick 1H started")
+    log.info("🤖 Bot Doji 1H started")
     notify(
-        "🤖 <b>Bot Trading Aktif - Candlestick 1H</b>\n"
-        f"Strategi : Engulfing + Doji + Harami\n"
+        "🤖 <b>Bot Trading Aktif - Doji 1H</b>\n"
+        f"Strategi : Bullish & Bearish Doji\n"
         f"Timeframe: 1 Jam\n"
-        f"SL       : Dinamis (low/high candle)\n"
-        f"TP       : 1% fixed\n"
-        f"Pairs    : Top 20 USDT Perp\n"
+        f"SL       : 0.4% dari harga entry\n"
+        f"TP       : 0.7% dari harga entry\n"
+        f"RR       : 1:1.75\n"
+        f"Pairs    : 40 USDT Perp\n"
         f"Max Pos  : {MAX_POSITIONS}\n"
         f"Margin   : ${MARGIN_PER_TRADE}/trade\n"
         f"Hard Stop: -${MAX_LOSS_TOTAL}"
