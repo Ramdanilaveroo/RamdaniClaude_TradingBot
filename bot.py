@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Bybit USDT Perpetual Futures Scalping Bot
-Strategy : Doji Candlestick Pattern Only
-Timeframe: 1H | SL dinamis (low/high doji) | TP 1% fixed
+Bybit USDT Perpetual Futures Bot
+Strategy : Doji Trend Continuation
+Timeframe: 1H
 Author   : Built with Claude
 
 Logic:
-- BULLISH DOJI : doji muncul setelah candle bearish → entry LONG
-                 SL = low candle doji
-- BEARISH DOJI : doji muncul setelah candle bullish → entry SHORT
-                 SL = high candle doji
+- LONG  : candle sebelumnya hijau + doji muncul
+          → pasang limit BUY  di HIGH doji (ekor atas)
+          → kalau harga naik tembus high doji → terisi → Long
+          → SL = low doji | TP = 0.7%
+
+- SHORT : candle sebelumnya merah + doji muncul
+          → pasang limit SELL di LOW doji (ekor bawah)
+          → kalau harga turun tembus low doji → terisi → Short
+          → SL = high doji | TP = 0.7%
+
+Order type: Limit (lebih murah fee, entry lebih presisi)
+Pending order dibatalkan kalau candle 1H berikutnya close tanpa terisi
 """
 
 import os, time, json, math, logging, base64
@@ -33,8 +41,7 @@ SCAN_INTERVAL    = 120     # scan setiap 2 menit
 MARGIN_PER_TRADE = 1.5
 MAX_POSITIONS    = 5
 MAX_LOSS_TOTAL   = 30.0
-SL_PCT_FIXED     = 0.004   # SL fixed 0.4% dari harga entry
-TP_PCT           = 0.007   # TP fixed 0.7% dari harga entry
+TP_PCT           = 0.007   # TP 0.7%
 RECV_WINDOW      = "5000"
 
 # Doji threshold
@@ -61,9 +68,10 @@ log = logging.getLogger(__name__)
 #  STATE
 # ══════════════════════════════════════════════════
 total_realized_pnl: float = 0.0
-open_positions: dict = {}
+open_positions: dict  = {}   # symbol → posisi aktif
+pending_orders: dict  = {}   # symbol → pending limit order
 _instrument_cache: dict = {}
-_last_signal: dict = {}
+_last_signal: dict    = {}   # symbol → candle ts yang udah diproses
 
 # ══════════════════════════════════════════════════
 #  RSA SIGNING
@@ -141,13 +149,6 @@ def get_candles(symbol, limit=5):
         "volume": float(row[5]),
     } for row in rows]
 
-def get_last_price(symbol):
-    r = api_get("/v5/market/tickers", {"category": CATEGORY, "symbol": symbol})
-    try:
-        return float(r["result"]["list"][0]["lastPrice"])
-    except:
-        return 0.0
-
 # ══════════════════════════════════════════════════
 #  INSTRUMENT INFO
 # ══════════════════════════════════════════════════
@@ -187,61 +188,39 @@ def round_qty(qty, step):
     return f"{math.floor(qty / step) * step:.{dec}f}"
 
 # ══════════════════════════════════════════════════
-#  DOJI PATTERN
+#  DOJI DETECTION
 # ══════════════════════════════════════════════════
 def is_doji(c) -> bool:
-    """Candle doji: body <= 5% dari total range."""
     tr = c["high"] - c["low"]
     if tr == 0:
         return False
-    body = abs(c["close"] - c["open"])
-    return body / tr <= DOJI_BODY_PCT
+    return abs(c["close"] - c["open"]) / tr <= DOJI_BODY_PCT
 
-def check_doji(prev, curr):
+def check_doji_signal(prev, doji):
     """
-    Bullish Doji : doji setelah candle bearish → Long, SL = low doji
-    Bearish Doji : doji setelah candle bullish → Short, SL = high doji
-    Returns (direction, sl_price, pattern) atau None
+    Long  : prev hijau + doji → entry limit di HIGH doji
+    Short : prev merah + doji → entry limit di LOW doji
+    Returns (direction, entry_price, sl_price) atau None
     """
-    if not is_doji(curr):
+    if not is_doji(doji):
         return None
 
-    # BULLISH DOJI
-    if prev["close"] < prev["open"]:
-        return ("long", curr["low"], "Bullish Doji ⭐")
-
-    # BEARISH DOJI
+    # LONG: prev hijau → entry di HIGH doji
     if prev["close"] > prev["open"]:
-        return ("short", curr["high"], "Bearish Doji ⭐")
+        entry_price = doji["high"]
+        sl_price    = doji["low"]
+        return ("long", entry_price, sl_price)
+
+    # SHORT: prev merah → entry di LOW doji
+    if prev["close"] < prev["open"]:
+        entry_price = doji["low"]
+        sl_price    = doji["high"]
+        return ("short", entry_price, sl_price)
 
     return None
 
 # ══════════════════════════════════════════════════
-#  SIGNAL ENGINE
-# ══════════════════════════════════════════════════
-def get_signal(symbol):
-    candles = get_candles(symbol, 5)
-    if len(candles) < 3:
-        return None, None, None
-
-    prev = candles[-3]
-    curr = candles[-2]  # candle 1H terakhir yang sudah closed
-
-    # Cegah double entry pada candle yang sama
-    candle_ts = curr["ts"]
-    if _last_signal.get(symbol) == candle_ts:
-        return None, None, None
-
-    result = check_doji(prev, curr)
-    if result:
-        _last_signal[symbol] = candle_ts
-        direction, sl_price, pattern = result
-        return direction, sl_price, pattern
-
-    return None, None, None
-
-# ══════════════════════════════════════════════════
-#  POSITION MANAGEMENT
+#  ORDER MANAGEMENT
 # ══════════════════════════════════════════════════
 def count_open_positions():
     r = api_get("/v5/position/list", {"category": CATEGORY, "settleCoin": "USDT"})
@@ -256,8 +235,9 @@ def set_leverage(symbol, lev):
         "buyLeverage": str(lev), "sellLeverage": str(lev),
     })
 
-def place_order(symbol, direction, sl_price_raw, pattern):
-    if symbol in open_positions:
+def place_limit_order(symbol, direction, entry_price, sl_price_raw):
+    """Pasang limit order di high/low doji."""
+    if symbol in pending_orders or symbol in open_positions:
         return
     if count_open_positions() >= MAX_POSITIONS:
         return
@@ -266,61 +246,140 @@ def place_order(symbol, direction, sl_price_raw, pattern):
     set_leverage(symbol, lev)
     time.sleep(0.3)
 
-    price = get_last_price(symbol)
-    if price == 0:
-        return
-
     pos_value = MARGIN_PER_TRADE * lev
     tick    = tick_size(symbol)
     step    = qty_step(symbol)
-    qty_str = round_qty(pos_value / price, step)
+    qty_str = round_qty(pos_value / entry_price, step)
 
-    # SL fixed 0.4% dari entry
+    entry_str = round_price(entry_price, tick)
+    sl_str    = round_price(sl_price_raw, tick)
+
     if direction == "long":
         side     = "Buy"
-        sl_price = round_price(price * (1 - SL_PCT_FIXED), tick)
-        tp_price = round_price(price * (1 + TP_PCT), tick)
+        tp_str   = round_price(entry_price * (1 + TP_PCT), tick)
     else:
         side     = "Sell"
-        sl_price = round_price(price * (1 + SL_PCT_FIXED), tick)
-        tp_price = round_price(price * (1 - TP_PCT), tick)
+        tp_str   = round_price(entry_price * (1 - TP_PCT), tick)
 
-    # Hitung RR actual
-    sl_dist = price * SL_PCT_FIXED
-    tp_dist = price * TP_PCT
-    rr = round(tp_dist / sl_dist, 2)
+    # Hitung RR
+    sl_dist = abs(entry_price - sl_price_raw)
+    tp_dist = entry_price * TP_PCT
+    rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
 
     r = api_post("/v5/order/create", {
-        "category": CATEGORY, "symbol": symbol,
-        "side": side, "orderType": "Market", "qty": qty_str,
-        "stopLoss": sl_price, "takeProfit": tp_price,
-        "tpslMode": "Full", "reduceOnly": False, "closeOnTrigger": False,
+        "category":   CATEGORY,
+        "symbol":     symbol,
+        "side":       side,
+        "orderType":  "Limit",
+        "qty":        qty_str,
+        "price":      entry_str,
+        "stopLoss":   sl_str,
+        "takeProfit": tp_str,
+        "tpslMode":   "Full",
+        "timeInForce": "GTC",   # Good Till Cancel
+        "reduceOnly": False,
+        "closeOnTrigger": False,
     })
 
     if r.get("retCode") == 0:
-        open_positions[symbol] = {
-            "direction": direction, "entry": price,
-            "sl": sl_price, "tp": tp_price,
-            "leverage": lev, "pattern": pattern,
+        order_id = r["result"]["orderId"]
+        pending_orders[symbol] = {
+            "orderId":   order_id,
+            "direction": direction,
+            "entry":     entry_price,
+            "sl":        sl_str,
+            "tp":        tp_str,
+            "leverage":  lev,
         }
-        sl_label = "-0.4%"
+        sl_label = "low doji" if direction == "long" else "high doji"
         msg = (
-            f"✅ <b>OPEN {direction.upper()}</b>\n"
+            f"⏳ <b>PENDING {direction.upper()}</b>\n"
             f"Pair     : {symbol}\n"
-            f"Pattern  : {pattern}\n"
-            f"Entry    : {price}\n"
-            f"SL       : {sl_price} ({sl_label})\n"
-            f"TP       : {tp_price} (+1.0%)\n"
+            f"Pattern  : Doji Trend Continuation\n"
+            f"Entry    : {entry_str} ({'ekor atas' if direction == 'long' else 'ekor bawah'} doji)\n"
+            f"SL       : {sl_str} ({sl_label})\n"
+            f"TP       : {tp_str} (+0.7%)\n"
             f"RR       : 1:{rr}\n"
-            f"Leverage : {lev}x  |  Margin: ${MARGIN_PER_TRADE}\n"
-            f"Positions: {count_open_positions()}/{MAX_POSITIONS}"
+            f"Leverage : {lev}x  |  Margin: ${MARGIN_PER_TRADE}"
         )
         notify(msg)
         log.info(msg.replace("<b>","").replace("</b>",""))
     else:
-        log.error(f"Order failed {symbol}: {r}")
+        log.error(f"Limit order failed {symbol}: {r}")
 
-def sync_closed():
+def cancel_order(symbol, order_id):
+    """Batalkan pending order yang belum terisi."""
+    r = api_post("/v5/order/cancel", {
+        "category": CATEGORY,
+        "symbol":   symbol,
+        "orderId":  order_id,
+    })
+    return r.get("retCode") == 0
+
+def check_order_status(symbol, order_id):
+    """Cek status order: 'filled', 'cancelled', 'pending'."""
+    r = api_get("/v5/order/realtime", {
+        "category": CATEGORY,
+        "symbol":   symbol,
+        "orderId":  order_id,
+    })
+    try:
+        status = r["result"]["list"][0]["orderStatus"]
+        if status == "Filled":
+            return "filled"
+        elif status in ("Cancelled", "Rejected", "Deactivated"):
+            return "cancelled"
+        return "pending"
+    except:
+        return "cancelled"
+
+# ══════════════════════════════════════════════════
+#  SYNC POSITIONS & ORDERS
+# ══════════════════════════════════════════════════
+def sync_pending_orders(current_candle_ts: dict):
+    """
+    Cek pending orders:
+    - Kalau terisi → pindah ke open_positions
+    - Kalau candle baru sudah close tapi belum terisi → cancel
+    """
+    to_remove = []
+    for symbol, info in pending_orders.items():
+        status = check_order_status(symbol, info["orderId"])
+
+        if status == "filled":
+            # Order terisi → posisi aktif
+            open_positions[symbol] = info
+            to_remove.append(symbol)
+            msg = (
+                f"✅ <b>OPEN {info['direction'].upper()} (Terisi!)</b>\n"
+                f"Pair     : {symbol}\n"
+                f"Entry    : {info['entry']}\n"
+                f"SL       : {info['sl']}\n"
+                f"TP       : {info['tp']}\n"
+                f"Leverage : {info['leverage']}x"
+            )
+            notify(msg)
+            log.info(f"Order filled: {symbol}")
+
+        elif status == "cancelled":
+            to_remove.append(symbol)
+            log.info(f"Order cancelled: {symbol}")
+
+        else:
+            # Masih pending — cek apakah candle baru sudah muncul
+            candle_ts = current_candle_ts.get(symbol, 0)
+            if candle_ts and candle_ts != info.get("candle_ts", 0):
+                # Candle baru sudah close → cancel order lama
+                if cancel_order(symbol, info["orderId"]):
+                    notify(f"❌ <b>CANCEL</b> {symbol} — candle baru terbentuk, order tidak terisi")
+                    log.info(f"Order cancelled (new candle): {symbol}")
+                to_remove.append(symbol)
+
+    for s in to_remove:
+        pending_orders.pop(s, None)
+
+def sync_closed_positions():
+    """Sync posisi yang sudah closed."""
     global total_realized_pnl
     closed = []
     for symbol, info in open_positions.items():
@@ -339,7 +398,6 @@ def sync_closed():
                 notify(
                     f"{emoji} <b>CLOSED {info['direction'].upper()}</b>\n"
                     f"Pair     : {symbol}\n"
-                    f"Pattern  : {info.get('pattern', '-')}\n"
                     f"PnL      : {'+' if pnl>=0 else ''}{pnl:.4f} USDT\n"
                     f"Total PnL: {total_realized_pnl:+.4f} USDT"
                 )
@@ -350,17 +408,40 @@ def sync_closed():
         open_positions.pop(s, None)
 
 # ══════════════════════════════════════════════════
+#  SIGNAL ENGINE
+# ══════════════════════════════════════════════════
+def get_signal(symbol):
+    candles = get_candles(symbol, 5)
+    if len(candles) < 3:
+        return None, None, None
+
+    prev = candles[-3]
+    doji = candles[-2]  # candle 1H terakhir yang sudah closed
+
+    # Cegah double entry pada candle yang sama
+    if _last_signal.get(symbol) == doji["ts"]:
+        return None, None, None
+
+    result = check_doji_signal(prev, doji)
+    if result:
+        _last_signal[symbol] = doji["ts"]
+        direction, entry_price, sl_price = result
+        return direction, entry_price, sl_price
+
+    return None, None, None
+
+# ══════════════════════════════════════════════════
 #  MAIN LOOP
 # ══════════════════════════════════════════════════
 def run():
-    log.info("🤖 Bot Doji 1H started")
+    log.info("🤖 Bot Doji Trend Continuation 1H started")
     notify(
-        "🤖 <b>Bot Trading Aktif - Doji 1H</b>\n"
-        f"Strategi : Bullish & Bearish Doji\n"
+        "🤖 <b>Bot Trading Aktif - Doji Trend</b>\n"
+        f"Strategi : Doji Trend Continuation\n"
         f"Timeframe: 1 Jam\n"
-        f"SL       : 0.4% dari harga entry\n"
-        f"TP       : 0.7% dari harga entry\n"
-        f"RR       : 1:1.75\n"
+        f"Entry    : Limit di ekor atas/bawah doji\n"
+        f"SL       : Low/High doji\n"
+        f"TP       : 0.7% dari entry\n"
         f"Pairs    : 40 USDT Perp\n"
         f"Max Pos  : {MAX_POSITIONS}\n"
         f"Margin   : ${MARGIN_PER_TRADE}/trade\n"
@@ -369,27 +450,49 @@ def run():
 
     while True:
         try:
+            # Hard stop check
             if total_realized_pnl <= -MAX_LOSS_TOTAL:
                 notify(f"🛑 <b>HARD STOP TRIGGERED</b>\nTotal loss: ${abs(total_realized_pnl):.2f}\nBot stopped.")
                 log.critical("HARD STOP TRIGGERED")
                 break
 
+            # Sync closed positions
             if open_positions:
-                sync_closed()
+                sync_closed_positions()
 
-            if count_open_positions() < MAX_POSITIONS:
+            # Cek candle timestamp terbaru untuk cancel logic
+            current_candle_ts = {}
+            for pair in TOP_PAIRS:
+                if pair in pending_orders:
+                    candles = get_candles(pair, 3)
+                    if candles:
+                        current_candle_ts[pair] = candles[-2]["ts"]
+                    time.sleep(0.2)
+
+            # Sync pending orders
+            if pending_orders:
+                sync_pending_orders(current_candle_ts)
+
+            # Scan sinyal baru
+            total_active = count_open_positions() + len(pending_orders)
+            if total_active < MAX_POSITIONS:
                 for pair in TOP_PAIRS:
-                    if pair in open_positions:
+                    if pair in open_positions or pair in pending_orders:
                         continue
-                    if count_open_positions() >= MAX_POSITIONS:
+                    if count_open_positions() + len(pending_orders) >= MAX_POSITIONS:
                         break
-                    direction, sl_price, pattern = get_signal(pair)
+
+                    direction, entry_price, sl_price = get_signal(pair)
                     if direction:
-                        log.info(f"Signal {direction.upper()} → {pair} | {pattern}")
-                        place_order(pair, direction, sl_price, pattern)
+                        log.info(f"Doji signal {direction.upper()} → {pair} | Entry: {entry_price}")
+                        place_limit_order(pair, direction, entry_price, sl_price)
                         time.sleep(1)
 
-            log.info(f"Scan done | Open: {count_open_positions()} | Total PnL: {total_realized_pnl:+.4f}")
+            log.info(
+                f"Scan done | Open: {count_open_positions()} "
+                f"| Pending: {len(pending_orders)} "
+                f"| Total PnL: {total_realized_pnl:+.4f}"
+            )
             time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
